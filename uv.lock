@@ -369,6 +369,7 @@ dependencies = [
     { name = "datasets" },
     { name = "ipykernel" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "transformers" },
 ]
 
@@ -377,6 +378,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=4.8.4" },
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "torch", specifier = ">=2.11.0" },
+    { name = "tqdm", specifier = ">=4.67.3" },
     { name = "transformers", specifier = ">=5.4.0" },
 ]
 
