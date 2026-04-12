@@ -1,28 +1,28 @@
 import json
 import time
 from typing import Dict, List
-from itertools import product
+# from itertools import product
 
 import torch
 from transformers import AutoModelForQuestionAnswering, AutoTokenizer
 from tqdm import tqdm
 
-MODEL_NAME = "deepset/roberta-base-squad2"
-INPUT_FILE = "data/input_nq.json"
-# OUTPUT_FILE = "output/nq_256_128_5_output_nto.json"
+# MAX_LENGTH_LIST = [256, 384, 512]
+# STRIDE_LIST = [128, 256]
+# TOP_K_LIST = [3, 5]
 
 TIME_LIMIT = 8.0
-MAX_LEN = 256
-STRIDE = 128
+MAX_LENGTH = 384
+STRIDE = 256
 TOP_K = 5
 MAX_ANSWER_LEN = 50
-OPTIMUM_SCORE = 150
+OPTIMUM_SCORE = 20
 
-MAX_LEN_LIST = [256, 384, 512]
-STRIDE_LIST = [128, 256]
-TOP_K_LIST = [3,5,10]
+MODEL_NAME = "deepset/roberta-base-squad2"
+INPUT_FILE = "data/input_nq.json"
+OUTPUT_FILE = f"output/nq_{MAX_LENGTH}_{STRIDE}_{TOP_K}.json"
 
-VERBOSE = 0         # 0 | 1 | 2
+VERBOSE = 0     # 0 | 1 | 2
 
 def load_data(path: str) -> List[Dict[str, str]]:
     try:
@@ -33,7 +33,7 @@ def load_data(path: str) -> List[Dict[str, str]]:
 
     return data
 
-def predict(sample, max_len=MAX_LEN, stride=STRIDE, top_k=TOP_K):
+def predict(sample, max_length=MAX_LENGTH, stride=STRIDE, top_k=TOP_K):
     
     def time_exceed():
         return (time.perf_counter() - start_time) > TIME_LIMIT
@@ -82,7 +82,7 @@ def predict(sample, max_len=MAX_LEN, stride=STRIDE, top_k=TOP_K):
         text_pair=context,
         padding="max_length",
         truncation="only_second",
-        max_length=max_len,
+        max_length=max_length,
         stride=stride,
         return_tensors="pt",
         return_overflowing_tokens=True,
@@ -205,10 +205,8 @@ def predict(sample, max_len=MAX_LEN, stride=STRIDE, top_k=TOP_K):
                 if VERBOSE > 1:
                     print(f"\033[95mFallback answer: '{best_argmax_answer}' with score {best_argmax_score:.3f}\033[0m")                    
     
-    
     return return_answer()
     
-
 if __name__ == "__main__":
     data = load_data(INPUT_FILE)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -217,42 +215,41 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForQuestionAnswering.from_pretrained(MODEL_NAME).to(device).eval()
 
-    for max_len, stride, top_k in product(MAX_LEN_LIST, STRIDE_LIST, TOP_K_LIST):
-
-        if max_len <= stride:
-            print(f"Skipping invalid configuration: MAX_LEN={max_len} must be greater than STRIDE={stride}")
-            continue
-
-        print(f"Running configuration: MAX_LEN={max_len}, STRIDE={stride}, TOP_K={top_k}")
-
-        output_file = f"output/nq_{max_len}_{stride}_{top_k}_output.json"
+    # for max_len, stride, top_k in product(MAX_LENGTH_LIST, STRIDE_LIST, TOP_K_LIST):
+    #     print(f"\nRunning with max_length={max_len}, stride={stride}, top_k={top_k}\n")
+    #     if max_len <= stride:
+    #         print(f"Skipping invalid configuration: MAX_LEN={max_len} must be greater than STRIDE={stride}")
+    #         continue
+    #     output_file = f"output/nq_{max_len}_{stride}_{top_k}.json"
 
 
-        predictions = []
-        timed_out_count = 0
-        timed_out_qids = []
-        prediction_time_start = time.perf_counter()
+    predictions = []
+    timed_out_count = 0
+    timed_out_qids = []
+    prediction_time_start = time.perf_counter()
+    for sample in tqdm(data, desc="Running QA Agent"):
+        # result = predict(sample, max_length=max_len, stride=stride, top_k=top_k)
+        result = predict(sample, max_length=MAX_LENGTH, stride=STRIDE, top_k=TOP_K)
 
-        for sample in tqdm(data, desc="Running QA Agent"):
-            result = predict(sample, max_len=max_len, stride=stride, top_k=top_k)
+        if result["timed_out"]:
+            timed_out_count += 1
+            timed_out_qids.append(result["question_id"])
 
-            if result["timed_out"]:
-                timed_out_count += 1
-                timed_out_qids.append(result["question_id"])
+        predictions.append({
+            "question_id": result["question_id"],
+            "answer": result["answer"]
+        })
 
-            predictions.append({
-                "question_id": result["question_id"],
-                "answer": result["answer"]
-            })
+    # Save output
+    # with open(output_file, "w", encoding="utf-8") as f:
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(predictions, f, indent=2, ensure_ascii=False)
 
-        # Save output
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(predictions, f, indent=2, ensure_ascii=False)
-
-        prediction_time_end = time.perf_counter()
-        print(f"Saved predictions to {output_file}")
-        print(f"Total runtime: {prediction_time_end - prediction_time_start:.2f} seconds")
-        print(f"Timed out questions: {timed_out_count}/{len(data)} ({(timed_out_count/len(data))*100:.2f}%)")
-        if timed_out_qids:
-            print("Timed out question IDs:")
-            print(timed_out_qids)
+    prediction_time_end = time.perf_counter()
+    # print(f"Saved predictions to {output_file}")
+    print(f"Saved predictions to {OUTPUT_FILE}")
+    print(f"Total runtime: {prediction_time_end - prediction_time_start:.2f} seconds")
+    print(f"Timed out questions: {timed_out_count}/{len(data)} ({(timed_out_count/len(data))*100:.2f}%)")
+    if timed_out_qids:
+        print("Timed out question IDs:")
+        print(timed_out_qids)

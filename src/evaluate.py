@@ -4,7 +4,7 @@ import string
 from collections import Counter
 
 
-PREFIX = "nq_512_256_10_output"
+PREFIX = "nq_384_256_3"
 GOLD_FILE = "data/input_nq.json"
 PRED_FILE = f"output/{PREFIX}.json"
 ERROR_FILE = f"output/error/{PREFIX}_error.json"
@@ -95,7 +95,7 @@ def evaluate(gold_file: str, pred_file: str, error_file: str, detail_file: str):
 
     for item in gold_data:
         qid = item["question_id"]
-        answers = item.get("golden_answer", [])
+        answers = item.get("golden_answers", [])
         if isinstance(answers, str):
             answers = [answers]
 

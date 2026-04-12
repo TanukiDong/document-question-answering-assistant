@@ -124,7 +124,7 @@ def convert_csv_to_input_json(input_csv: str, output_json: str):
                 "question_id": question_id,
                 "question": question,
                 "document": document,
-                "golden_answer": [golden_answer]
+                "golden_answers": [golden_answer]
             })
 
         except Exception as e:
