@@ -7,20 +7,29 @@ import torch
 from transformers import AutoModelForQuestionAnswering, AutoTokenizer
 from tqdm import tqdm
 
+
+# import sys
+# log_file = open("output/log.txt", "w", encoding="utf-8")
+# sys.stdout = log_file
+
+
 # MAX_LENGTH_LIST = [256, 384, 512]
 # STRIDE_LIST = [128, 256]
 # TOP_K_LIST = [3, 5]
 
-TIME_LIMIT = 8.0
+TIME_LIMIT = 10
+TIME_BUFFER = 1.0
 MAX_LENGTH = 384
 STRIDE = 256
-TOP_K = 5
-MAX_ANSWER_LEN = 50
+TOP_K = 10
+MAX_ANSWER_LEN = 15
 OPTIMUM_SCORE = 20
 
 MODEL_NAME = "deepset/roberta-base-squad2"
 INPUT_FILE = "data/input_nq.json"
-OUTPUT_FILE = f"output/nq_{MAX_LENGTH}_{STRIDE}_{TOP_K}.json"
+# INPUT_FILE = "data/nq_error.json"
+# OUTPUT_FILE = f"output/nq_{MAX_LENGTH}_{STRIDE}_{TOP_K}.json"
+OUTPUT_FILE = "output/tmp.json"
 
 VERBOSE = 0     # 0 | 1 | 2
 
@@ -30,24 +39,26 @@ def load_data(path: str) -> List[Dict[str, str]]:
             data = json.load(f)
     except Exception as e:
         raise ValueError(f"Failed to read input file: {path}. Please move the file to the correct location ({path}).")
-
     return data
 
-def predict(sample, max_length=MAX_LENGTH, stride=STRIDE, top_k=TOP_K):
-    
-    def time_exceed():
-        return (time.perf_counter() - start_time) > TIME_LIMIT
-    
-    def final_answer():
-        if best_answer:
-            return (best_answer, best_score)
-        elif best_argmax_answer:
-            return (best_argmax_answer, best_argmax_score)
-        else:
-            return (context[:100].strip() if context.strip() else "unknown", float("-inf"))
+def predict(sample: Dict[str, str],
+            tokenizer: AutoTokenizer,
+            model: AutoModelForQuestionAnswering,
+            device: torch.device,
+            max_length: int = MAX_LENGTH,
+            stride: int = STRIDE,
+            top_k: int = TOP_K
+            ) -> Dict[str, object]:
+       
+    def time_exceed(buffer: float = TIME_BUFFER) -> bool:
+        return (time.perf_counter() - start_time + buffer) > TIME_LIMIT
         
     def return_answer(reason=None):
-        answer, score = final_answer()
+        # Determine final answer
+        if best_answer:
+            answer, score = best_answer, best_score
+        else:
+            answer, score = "unknown", float("-inf")
         
         if VERBOSE:
             if reason == "timeout":
@@ -62,25 +73,45 @@ def predict(sample, max_length=MAX_LENGTH, stride=STRIDE, top_k=TOP_K):
             "timed_out": (reason == "timeout")
         }
     
+    def process_chunk(i, start_logits, end_logits, encoding):
+        
+        if VERBOSE:
+            print(f"Processing chunk {i+1}/{len(start_logits)}")
+        
+        start_logit = start_logits[i]
+        end_logit = end_logits[i]
+
+        offsets = encoding["offset_mapping"][i].tolist()
+        sequence_ids = encoding.sequence_ids(i)
+    
+        # Mask
+        mask = torch.tensor(
+            [sid == 1 for sid in sequence_ids],
+            device=start_logit.device,
+            dtype=torch.bool
+        )
+        
+        # Mask out non-context tokens
+        start_logit_masked = start_logit.masked_fill(~mask, float("-inf"))
+        end_logit_masked = end_logit.masked_fill(~mask, float("-inf"))
+        
+        return start_logit_masked, end_logit_masked, offsets, sequence_ids
+    
     start_time = time.perf_counter()
+    
     question_id = sample["question_id"]
     question = sample["question"]
     context = sample["document"]
-
     if VERBOSE:
         print(f"Question ID: {question_id}")
-        # print(f"Question: {question}")
-        # print(f"Document: {context[:50]}...")
     
     best_answer = ""
     best_score = float("-inf")
-    best_argmax_answer = ""
-    best_argmax_score = float("-inf")
 
     encoding = tokenizer(
         text=question,
         text_pair=context,
-        padding="max_length",
+        padding=True,
         truncation="only_second",
         max_length=max_length,
         stride=stride,
@@ -99,8 +130,11 @@ def predict(sample, max_length=MAX_LENGTH, stride=STRIDE, top_k=TOP_K):
     start_logits = outputs.start_logits
     end_logits = outputs.end_logits
 
+    if VERBOSE:
+        print(f"Starting first pass with start indexes")
+        
     # For each chunk
-    for i, (start_logits_chunk, end_logits_chunk) in enumerate(zip(start_logits, end_logits)):
+    for i in range(len(start_logits)):
         
         # Exit search if time limit exceeded
         if time_exceed():
@@ -109,18 +143,12 @@ def predict(sample, max_length=MAX_LENGTH, stride=STRIDE, top_k=TOP_K):
         if best_score >= OPTIMUM_SCORE:
             return return_answer(reason="optimum")
         
-        if VERBOSE:
-            # print every 10 chunks
-            if (i + 1) % 10 == 0:
-                print(f"Processing chunk {i+1}/{len(start_logits)}")
-
-        offsets = encoding["offset_mapping"][i].tolist()
-        sequence_ids = encoding.sequence_ids(i)
+        start_logit_masked, end_logit_masked, offsets, sequence_ids = process_chunk(i, start_logits, end_logits, encoding)
 
         # Top-k start and end positions
-        start_indexes = torch.topk(start_logits_chunk, top_k).indices.tolist()
-        end_indexes = torch.topk(end_logits_chunk, top_k).indices.tolist()
+        start_indexes = torch.topk(start_logit_masked, top_k).indices.tolist()
         
+        # First part : Start with start indexes
         for start_idx in start_indexes:
             
             # Exit search if time limit exceeded
@@ -130,7 +158,6 @@ def predict(sample, max_length=MAX_LENGTH, stride=STRIDE, top_k=TOP_K):
             if best_score >= OPTIMUM_SCORE:
                 return return_answer(reason="optimum")
             
-            
             # Skip if the start index is not part of the context
             if sequence_ids[start_idx] != 1:
                 continue
@@ -138,7 +165,8 @@ def predict(sample, max_length=MAX_LENGTH, stride=STRIDE, top_k=TOP_K):
             # Get character offsets for the start index
             start_char, _ = offsets[start_idx]
 
-            for end_idx in end_indexes:
+            end_max = min(len(start_logit_masked) - 1, start_idx + MAX_ANSWER_LEN - 1)
+            for end_idx in range(start_idx, end_max + 1):
                 
                 # Exit search if time limit exceeded
                 if time_exceed():
@@ -150,61 +178,112 @@ def predict(sample, max_length=MAX_LENGTH, stride=STRIDE, top_k=TOP_K):
                 # Skip if the end index is not part of the context
                 if sequence_ids[end_idx] != 1:
                     continue
-                
-                # Skip if start index is after end index
-                if start_idx > end_idx:
-                    continue
-                    
-                # Skip if the answer is too long
-                if end_idx - start_idx + 1 > MAX_ANSWER_LEN:
-                    continue
 
                 # Get character offsets for the end index
                 _, end_char = offsets[end_idx]
-                
-                # Skip if start_char is after end_char
-                if start_char > end_char:
-                    continue
 
                 # Extract answer text from context
-                answer_candidate = context[start_char:end_char].strip()
+                candidate_answer = context[start_char:end_char].strip()
                 
                 # Skip if answer is empty
-                if not answer_candidate:
+                if not candidate_answer:
                     continue
 
                 # Calculate score for the candidate answer
-                score_candidate = start_logits_chunk[start_idx].item() + end_logits_chunk[end_idx].item()
+                candidate_score = start_logit_masked[start_idx].item() + end_logit_masked[end_idx].item()
                 
                 if VERBOSE > 1:
-                    print(f"Candidate answer: '{answer_candidate}', Score: {score_candidate:.3f}")
+                    print(f"Candidate answer: '{candidate_answer}', Score: {candidate_score:.3f}")
                 
                 # Update best answer
-                if score_candidate > best_score:
-                    best_score = score_candidate
-                    best_answer = answer_candidate
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_answer = candidate_answer
                     
                     if VERBOSE > 1:
                         print(f"\033[93mNew best answer: '{best_answer}' with score {best_score:.3f}\033[0m")
+                        
+        if time_exceed():
+            return return_answer(reason="timeout")
+    
+    if time_exceed(buffer=TIME_LIMIT * 1/4):
+            return return_answer()
+            
+    if VERBOSE:
+        print("Starting second pass with end indexes")
+    
+    # For each chunk
+    for i in range(len(start_logits)):
+        
+        # Exit search if time limit exceeded
+        if time_exceed():
+            return return_answer(reason="timeout")
+        # Exit search if optimum score reached
+        if best_score >= OPTIMUM_SCORE:
+            return return_answer(reason="optimum")
+        
+        start_logit_masked, end_logit_masked, offsets, sequence_ids = process_chunk(i, start_logits, end_logits, encoding)
 
-
-        # Argmax fallback
-        logits_sum = start_logits_chunk + end_logits_chunk
-        argmax_idx = torch.argmax(logits_sum).item()
-        # Skip non-context text
-        if sequence_ids[argmax_idx] == 1:
-            char_start, char_end = offsets[argmax_idx]
-            # Skip invalid spans
-            if char_start < char_end:
-                argmax_score = logits_sum[argmax_idx].item()
-                # Update best argmax answer
-                if argmax_score > best_argmax_score:
-                    best_argmax_score = argmax_score
-                    best_argmax_answer = context[char_start:char_end].strip()
+        end_indexes = torch.topk(end_logit_masked, top_k).indices.tolist()
+        
+        # Second part : Start with end indexes
+        for end_idx in end_indexes:
+                            
+             # Exit search if time limit exceeded
+            if time_exceed():
+                return return_answer(reason="timeout")
+            # Exit search if optimum score reached
+            if best_score >= OPTIMUM_SCORE:
+                return return_answer(reason="optimum")
+            
+            # Skip if the end index is not part of the context
+            if sequence_ids[end_idx] != 1:
+                continue
+            
+            # Get character offsets for the end index
+            _, end_char = offsets[end_idx]
+            
+            start_min = max(0, end_idx - MAX_ANSWER_LEN + 1)
+            for start_idx in range(start_min, end_idx + 1):
+                
+                # Exit search if time limit exceeded
+                if time_exceed():
+                    return return_answer(reason="timeout")
+                # Exit search if optimum score reached
+                if best_score >= OPTIMUM_SCORE:
+                    return return_answer(reason="optimum")
+                
+                # Skip if start index is not part of the context
+                if sequence_ids[start_idx] != 1:
+                    continue
+                
+                # Get start character offset
+                start_char, _ = offsets[start_idx]
+                
+                # Extract answer text from context
+                candidate_answer = context[start_char:end_char].strip()
+                
+                # Skip if answer is empty
+                if not candidate_answer:
+                        continue
+                    
+                # Calculate score for the candidate answer
+                candidate_score = start_logit_masked[start_idx].item() + end_logit_masked[end_idx].item()
                 
                 if VERBOSE > 1:
-                    print(f"\033[95mFallback answer: '{best_argmax_answer}' with score {best_argmax_score:.3f}\033[0m")                    
-    
+                    print(f"Candidate answer: '{candidate_answer}', Score: {candidate_score:.3f}")
+                    
+                # Update best answer
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_answer = candidate_answer
+                    
+                    if VERBOSE > 1:
+                        print(f"\033[93mNew best answer: '{best_answer}' with score {best_score:.3f}\033[0m") 
+        
+        if time_exceed():
+            return return_answer(reason="timeout")
+        
     return return_answer()
     
 if __name__ == "__main__":
@@ -229,8 +308,16 @@ if __name__ == "__main__":
     prediction_time_start = time.perf_counter()
     for sample in tqdm(data, desc="Running QA Agent"):
         # result = predict(sample, max_length=max_len, stride=stride, top_k=top_k)
-        result = predict(sample, max_length=MAX_LENGTH, stride=STRIDE, top_k=TOP_K)
-
+        result = predict(
+            sample=sample,
+            tokenizer=tokenizer,
+            model=model,
+            device=device,
+            max_length=MAX_LENGTH,
+            stride=STRIDE,
+            top_k=TOP_K,
+        )
+        
         if result["timed_out"]:
             timed_out_count += 1
             timed_out_qids.append(result["question_id"])
