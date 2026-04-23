@@ -4,12 +4,13 @@ import string
 from collections import Counter
 
 
-PREFIX = "nq_384_256_3"
+PREFIX = "tmp"
 GOLD_FILE = "data/input_nq.json"
 PRED_FILE = f"output/{PREFIX}.json"
 ERROR_FILE = f"output/error/{PREFIX}_error.json"
 DETAIL_FILE = f"output/eval/{PREFIX}_eval.json"
 SAVE_OUTPUT = False
+VERBOSE = 1
 
 def normalize_text(s: str) -> str:
     if s is None:
@@ -146,6 +147,14 @@ def evaluate(gold_file: str, pred_file: str, error_file: str, detail_file: str):
 
         if em == 0 or f1 < 0.5:
             error_analysis.append(result)
+            
+            if VERBOSE:
+                print(f"\033[91mError for QID {qid}:\033[0m")
+                print(f"  Question: {question}")
+                print(f"  Prediction: '{pred_answer}'")
+                print(f"  Golden Answers: {gold_answers}")
+                print(f"  Best Matching Gold: '{best_gold}'")
+                print(f"  EM: {em}, F1: {f1:.4f}\n")
 
     em_percent = 100.0 * em_sum / total
     f1_percent = 100.0 * f1_sum / total
