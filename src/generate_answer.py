@@ -1,39 +1,59 @@
+"""
+Document question answering pipeline using a pretrained Hugging Face extractive QA model.
+
+The script runs the QA pipeline end-to-end with the following steps:
+1. Load input data from a JSON file.
+2. Load the pretrained QA model and its corresponding tokenizer.
+3. Predict an answer for each question-document pair.
+4. Save the predictions to an output JSON file.
+5. Report runtime and timeout statistics.
+"""
 import json
 import time
-from typing import Dict, List
-# from itertools import product
+from typing import Dict, List, Tuple
 
 import torch
-from transformers import AutoModelForQuestionAnswering, AutoTokenizer
 from tqdm import tqdm
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer
 
+TIME_LIMIT      = 10
+TIME_BUFFER     = 1.0
+MAX_LENGTH      = 384
+STRIDE          = 256
+TOP_K           = 10
+MAX_ANSWER_LEN  = 15
+OPTIMUM_SCORE   = 20
 
-# import sys
-# log_file = open("output/log.txt", "w", encoding="utf-8")
-# sys.stdout = log_file
-
-
-# MAX_LENGTH_LIST = [256, 384, 512]
-# STRIDE_LIST = [128, 256]
-# TOP_K_LIST = [3, 5]
-
-TIME_LIMIT = 10
-TIME_BUFFER = 1.0
-MAX_LENGTH = 384
-STRIDE = 256
-TOP_K = 10
-MAX_ANSWER_LEN = 15
-OPTIMUM_SCORE = 20
-
-MODEL_NAME = "deepset/roberta-base-squad2"
-INPUT_FILE = "data/input_nq.json"
-# INPUT_FILE = "data/nq_error.json"
-# OUTPUT_FILE = f"output/nq_{MAX_LENGTH}_{STRIDE}_{TOP_K}.json"
-OUTPUT_FILE = "output/tmp.json"
+MODEL_NAME  = "deepset/roberta-base-squad2"
+DATASET     = "nq"  # "squad" | "nq"
+INPUT_FILE  = f"data/input_{DATASET}.json"
+OUTPUT_FILE = f"output/{DATASET}_{MAX_LENGTH}_{STRIDE}_{TOP_K}.json"
 
 VERBOSE = 0     # 0 | 1 | 2
 
 def load_data(path: str) -> List[Dict[str, str]]:
+    """
+    Load input data from a JSON file.
+    
+    Parameters
+    ----------
+    path : str
+        Path to the input JSON file containing questions and documents.
+        The file is expected to include the following fields for each item:
+        - "question_id": A unique identifier for the question.
+        - "question": The question text.
+        - "document": The context document from which the answer should be extracted.
+    
+    Returns
+    -------
+    data : List[Dict[str, str]]
+        A list of QA samples loaded from the input JSON file.
+        
+    Raises
+    ------
+    ValueError
+        If the file cannot be read.
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -49,12 +69,76 @@ def predict(sample: Dict[str, str],
             stride: int = STRIDE,
             top_k: int = TOP_K
             ) -> Dict[str, object]:
+    """
+    Predict an extractive answer span for a single QA sample.
+    1. Tokenizes the document into overlapping chunks.
+    2. For each chunk, the model calculates start and end logits for potential answer spans.
+    3. Candidates spans are selected based on top-k start and end logits.
+        3.1 Top-k start indexes with all valid end indexes within MAX_ANSWER_LEN.
+        3.2 Top-k end indexes with all valid start indexes within MAX_ANSWER_LEN.
+        3.3 Second pass only starts if 25% of the time remains.
+    4. The best answer is chosen by the highest combined start and end logit score.
+    
+    Parameters
+    ----------
+    sample : Dict[str, str]
+        A single QA sample read from the input JSON file.
+    tokenizer : transformers.AutoTokenizer
+        The Hugging Face tokenizer corresponding to the QA model.
+    model : transformers.AutoModelForQuestionAnswering
+        The pretrained Hugging Face extractive QA model.
+    device : torch.device
+        The device on which to perform operations.
+        "cuda" for GPU or "cpu" for CPU.
+    max_length : int, optional
+        The maximum token length per chunk, by default MAX_LENGTH (384).
+    stride : int, optional
+        The number of tokens to overlap between consecutive chunks, by default STRIDE (256).
+    top_k : int, optional
+        The number of top start and end logits to consider for candidate answer spans, by default TOP_K (10).
+        
+    Returns
+    -------
+    Dict[str, object]
+        Final output dictionary containing question ID, predicted answer, and timeout flag.
+    """
        
     def time_exceed(buffer: float = TIME_BUFFER) -> bool:
+        """
+        Check whether the elapsed time has exceeded the time limit plus a buffer.
+        
+        Parameters
+        ----------
+        buffer : float, optional
+            Safety buffer in seconds to account for any final processing, by default TIME_BUFFER (1.0 second).
+            
+        Returns
+        -------
+        bool
+            True if the elapsed time plus buffer exceeds the time limit, otherwise False.
+        """
         return (time.perf_counter() - start_time + buffer) > TIME_LIMIT
         
     def return_answer(reason=None):
-        # Determine final answer
+        """
+        Construct the result dictionary to return the predicted answer and metadata.
+        
+        Parameters
+        ----------
+        reason : str, optional
+            The reason for returning the answer
+            - "timeout" if the time limit was exceeded
+            - "optimum" if the optimum score was reached
+            - None for normal completion
+            
+        Returns
+        -------
+        Dict[str, object]
+            A dictionary containing the predicted answer and metadata:
+            - "question_id": The unique identifier for the question.
+            - "answer": The predicted answer text extracted from the document.
+            - "timed_out": A boolean indicating whether the prediction process timed out or not.
+        """
         if best_answer:
             answer, score = best_answer, best_score
         else:
@@ -73,17 +157,29 @@ def predict(sample: Dict[str, str],
             "timed_out": (reason == "timeout")
         }
     
-    def process_chunk(i, start_logits, end_logits, encoding):
+    def process_chunk(start_logit: torch.Tensor,
+                      end_logit: torch.Tensor,
+                      sequence_ids: List[int]
+                      ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Process a single chunk of the encoded input by masking out non-context tokens.
         
-        if VERBOSE:
-            print(f"Processing chunk {i+1}/{len(start_logits)}")
-        
-        start_logit = start_logits[i]
-        end_logit = end_logits[i]
-
-        offsets = encoding["offset_mapping"][i].tolist()
-        sequence_ids = encoding.sequence_ids(i)
-    
+        Parameters
+        ----------
+        start_logit : torch.Tensor
+            The start logits for the current chunk.
+        end_logit : torch.Tensor
+            The end logits for the current chunk.
+        sequence_ids : List[int]
+            The sequence IDs for the current chunk.
+            Context tokens have a value of 1.
+            Question and special tokens have a value of 0.
+            
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor]
+            The masked start and end logits where non-context tokens have been set to -inf.
+        """
         # Mask
         mask = torch.tensor(
             [sid == 1 for sid in sequence_ids],
@@ -95,7 +191,7 @@ def predict(sample: Dict[str, str],
         start_logit_masked = start_logit.masked_fill(~mask, float("-inf"))
         end_logit_masked = end_logit.masked_fill(~mask, float("-inf"))
         
-        return start_logit_masked, end_logit_masked, offsets, sequence_ids
+        return start_logit_masked, end_logit_masked
     
     start_time = time.perf_counter()
     
@@ -142,8 +238,16 @@ def predict(sample: Dict[str, str],
         # Exit search if optimum score reached
         if best_score >= OPTIMUM_SCORE:
             return return_answer(reason="optimum")
+
+        if VERBOSE:
+            print(f"Processing chunk {i+1}/{len(start_logits)}")
+            
+        start_logit = start_logits[i]
+        end_logit = end_logits[i]
+        offsets = encoding["offset_mapping"][i].tolist()
+        sequence_ids = encoding.sequence_ids(i)
         
-        start_logit_masked, end_logit_masked, offsets, sequence_ids = process_chunk(i, start_logits, end_logits, encoding)
+        start_logit_masked, end_logit_masked = process_chunk(start_logit, end_logit, sequence_ids)
 
         # Top-k start and end positions
         start_indexes = torch.topk(start_logit_masked, top_k).indices.tolist()
@@ -221,8 +325,16 @@ def predict(sample: Dict[str, str],
         # Exit search if optimum score reached
         if best_score >= OPTIMUM_SCORE:
             return return_answer(reason="optimum")
+
+        if VERBOSE:
+            print(f"Processing chunk {i+1}/{len(start_logits)}")
+            
+        start_logit = start_logits[i]
+        end_logit = end_logits[i]
+        offsets = encoding["offset_mapping"][i].tolist()
+        sequence_ids = encoding.sequence_ids(i)
         
-        start_logit_masked, end_logit_masked, offsets, sequence_ids = process_chunk(i, start_logits, end_logits, encoding)
+        start_logit_masked, end_logit_masked = process_chunk(start_logit, end_logit, sequence_ids)
 
         end_indexes = torch.topk(end_logit_masked, top_k).indices.tolist()
         
@@ -294,20 +406,11 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForQuestionAnswering.from_pretrained(MODEL_NAME).to(device).eval()
 
-    # for max_len, stride, top_k in product(MAX_LENGTH_LIST, STRIDE_LIST, TOP_K_LIST):
-    #     print(f"\nRunning with max_length={max_len}, stride={stride}, top_k={top_k}\n")
-    #     if max_len <= stride:
-    #         print(f"Skipping invalid configuration: MAX_LEN={max_len} must be greater than STRIDE={stride}")
-    #         continue
-    #     output_file = f"output/nq_{max_len}_{stride}_{top_k}.json"
-
-
     predictions = []
     timed_out_count = 0
     timed_out_qids = []
     prediction_time_start = time.perf_counter()
     for sample in tqdm(data, desc="Running QA Agent"):
-        # result = predict(sample, max_length=max_len, stride=stride, top_k=top_k)
         result = predict(
             sample=sample,
             tokenizer=tokenizer,
@@ -328,12 +431,10 @@ if __name__ == "__main__":
         })
 
     # Save output
-    # with open(output_file, "w", encoding="utf-8") as f:
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(predictions, f, indent=2, ensure_ascii=False)
 
     prediction_time_end = time.perf_counter()
-    # print(f"Saved predictions to {output_file}")
     print(f"Saved predictions to {OUTPUT_FILE}")
     print(f"Total runtime: {prediction_time_end - prediction_time_start:.2f} seconds")
     print(f"Timed out questions: {timed_out_count}/{len(data)} ({(timed_out_count/len(data))*100:.2f}%)")
